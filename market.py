@@ -1,0 +1,328 @@
+import numpy as np
+from dataclasses import dataclass
+from collections import deque
+from bisect import bisect_left
+import itertools
+
+
+@dataclass
+class Order:
+    oid: int
+    agent_id: int
+    side: str
+    qty: int
+    price_ticks: int | None
+    t: int
+    ttl: int
+
+
+class LimitOrderBook:
+    def __init__(self, tick_size, rng, max_levels=2000):
+        self.tick_size = float(tick_size)
+        self.rng = rng
+        self.max_levels = int(max_levels)
+        self.expire_buckets = {}
+
+        self.bids = {}
+        self.asks = {}
+        self.bid_prices = []
+        self.ask_prices = []
+
+        self.orders = {}
+        self._oid = itertools.count(1)
+
+        self.last_trade_price = None
+        self.last_trade_ticks = None
+
+        self.trades = []
+        self.t = 0
+        self.trades_in_step = 0
+        self.volume_in_step = 0
+
+    def _insert_price(self, side, p):
+        if side == "buy":
+            if p in self.bids:
+                return
+            idx = bisect_left(self.bid_prices, p)
+            self.bid_prices.insert(idx, p)
+            self.bids[p] = deque()
+        else:
+            if p in self.asks:
+                return
+            idx = bisect_left(self.ask_prices, p)
+            self.ask_prices.insert(idx, p)
+            self.asks[p] = deque()
+
+    def _remove_price_if_empty(self, side, p):
+        if side == "buy":
+            q = self.bids.get(p)
+            if q is not None and len(q) == 0:
+                del self.bids[p]
+                i = bisect_left(self.bid_prices, p)
+                if i < len(self.bid_prices) and self.bid_prices[i] == p:
+                    self.bid_prices.pop(i)
+        else:
+            q = self.asks.get(p)
+            if q is not None and len(q) == 0:
+                del self.asks[p]
+                i = bisect_left(self.ask_prices, p)
+                if i < len(self.ask_prices) and self.ask_prices[i] == p:
+                    self.ask_prices.pop(i)
+
+    def best_bid_ticks(self):
+        if not self.bid_prices:
+            return None
+        return self.bid_prices[-1]
+
+    def best_ask_ticks(self):
+        if not self.ask_prices:
+            return None
+        return self.ask_prices[0]
+
+    def best_bid(self):
+        p = self.best_bid_ticks()
+        return None if p is None else p * self.tick_size
+
+    def best_ask(self):
+        p = self.best_ask_ticks()
+        return None if p is None else p * self.tick_size
+
+    def mid_price(self, fallback):
+        bb = self.best_bid()
+        ba = self.best_ask()
+        if bb is None and ba is None:
+            return float(fallback)
+        if bb is None:
+            return float(ba)
+        if ba is None:
+            return float(bb)
+        return 0.5 * (float(bb) + float(ba))
+
+    def spread(self):
+        bb = self.best_bid()
+        ba = self.best_ask()
+        if bb is None or ba is None:
+            return None
+        return float(ba - bb)
+
+    def _record_trade(self, price_ticks, qty, passive_agent_id, aggressive_agent_id):
+        px = float(price_ticks) * self.tick_size
+        self.last_trade_price = px
+        self.last_trade_ticks = int(price_ticks)
+        self.trades.append((self.t, px, int(qty), int(passive_agent_id), int(aggressive_agent_id)))
+
+    def cancel(self, oid):
+        o = self.orders.pop(oid, None)
+        if o is None:
+            return False
+        book = self.bids if o.side == "buy" else self.asks
+        prices = self.bid_prices if o.side == "buy" else self.ask_prices
+        if o.price_ticks is None:
+            return True
+        q = book.get(o.price_ticks)
+        if q is None:
+            return True
+        newq = deque([x for x in q if x != oid])
+        book[o.price_ticks] = newq
+        if len(newq) == 0:
+            i = bisect_left(prices, o.price_ticks)
+            if i < len(prices) and prices[i] == o.price_ticks:
+                prices.pop(i)
+            del book[o.price_ticks]
+        return True
+
+    def add_limit(self, agent_id, side, price, qty, ttl=1):
+        side = "buy" if side == "buy" else "sell"
+        qty = int(qty)
+        if qty <= 0:
+            return None
+        price_ticks = int(round(float(price) / self.tick_size))
+        oid = next(self._oid)
+        o = Order(oid=oid, agent_id=int(agent_id), side=side, qty=qty, price_ticks=price_ticks, t=self.t, ttl=int(ttl))
+        if o.ttl > 0:
+            self.expire_buckets.setdefault(o.t + o.ttl, []).append(oid)
+
+        self._match_incoming(o)
+        if o.qty > 0:
+            self._insert_price(side, price_ticks)
+            if side == "buy":
+                self.bids[price_ticks].append(oid)
+            else:
+                self.asks[price_ticks].append(oid)
+            self.orders[oid] = o
+        return oid
+
+    def add_market(self, agent_id, side, qty):
+        side = "buy" if side == "buy" else "sell"
+        qty = int(qty)
+        if qty <= 0:
+            return None
+        oid = next(self._oid)
+        o = Order(oid=oid, agent_id=int(agent_id), side=side, qty=qty, price_ticks=None, t=self.t, ttl=0)
+        if o.ttl > 0:
+            self.expire_buckets.setdefault(o.t + o.ttl, []).append(oid)
+
+        self._match_incoming(o)
+        return oid
+
+    def _pop_front_order(self, side, price_ticks):
+        book = self.bids if side == "buy" else self.asks
+        q = book.get(price_ticks)
+        while q is not None and len(q) > 0:
+            oid = q[0]
+            o = self.orders.get(oid)
+            if o is None or o.qty <= 0:
+                q.popleft()
+                continue
+            return oid, o
+        return None, None
+
+    def _match_incoming(self, incoming):
+        while incoming.qty > 0:
+            if incoming.side == "buy":
+                best_ask = self.best_ask_ticks()
+                if best_ask is None:
+                    break
+                if incoming.price_ticks is not None and incoming.price_ticks < best_ask:
+                    break
+                oid, resting = self._pop_front_order("sell", best_ask)
+                if resting is None:
+                    self._remove_price_if_empty("sell", best_ask)
+                    continue
+                traded = min(incoming.qty, resting.qty)
+                incoming.qty -= traded
+                resting.qty -= traded
+                self._record_trade(best_ask, traded, resting.agent_id, incoming.agent_id)
+                if resting.qty == 0:
+                    self.cancel(oid)
+                self._remove_price_if_empty("sell", best_ask)
+            else:
+                best_bid = self.best_bid_ticks()
+                if best_bid is None:
+                    break
+                if incoming.price_ticks is not None and incoming.price_ticks > best_bid:
+                    break
+                oid, resting = self._pop_front_order("buy", best_bid)
+                if resting is None:
+                    self._remove_price_if_empty("buy", best_bid)
+                    continue
+                traded = min(incoming.qty, resting.qty)
+                incoming.qty -= traded
+                resting.qty -= traded
+                self._record_trade(best_bid, traded, resting.agent_id, incoming.agent_id)
+                if resting.qty == 0:
+                    self.cancel(oid)
+                self._remove_price_if_empty("buy", best_bid)
+            
+            self.trades_in_step += 1
+            self.volume_in_step += float(traded)
+            # self.last_trade_price = incoming.price_ticks
+
+    def step_time(self):
+        self.t += 1
+        bucket = self.expire_buckets.pop(self.t, None)
+        if bucket:
+            for oid in bucket:
+                self.cancel(oid)
+
+    def reset_step_counters(self):
+        self.trades_in_step = 0
+        self.volume_in_step = 0.0
+
+    def _level_qty(self, side, price_ticks):
+        book = self.bids if side == "buy" else self.asks
+        q = book.get(price_ticks)
+        if q is None:
+            return 0.0
+        s = 0
+        for oid in q:
+            o = self.orders.get(oid)
+            if o is not None and o.qty > 0:
+                s += o.qty
+        return float(s)
+
+    def depth_at_best(self):
+        bb = self.best_bid_ticks()
+        ba = self.best_ask_ticks()
+        db = self._level_qty("buy", bb) if bb is not None else 0.0
+        da = self._level_qty("sell", ba) if ba is not None else 0.0
+        return float(db), float(da)
+
+
+
+    def snapshot_l2(self, depth=10):
+        bid_ticks = sorted(self.bid_prices, reverse=True)[:depth]
+        ask_ticks = sorted(self.ask_prices)[:depth]
+
+        bid_levels = [(p, self._level_qty("buy", p)) for p in bid_ticks]
+        ask_levels = [(p, self._level_qty("sell", p)) for p in ask_ticks]
+        return bid_levels, ask_levels
+
+
+
+class LOBMarket:
+    def __init__(self, S0, dt, seed, tick_size=0.01, base_spread_ticks=2):
+        self.dt = float(dt)
+        self.rng = np.random.default_rng(int(seed))
+        self.book = LimitOrderBook(tick_size=tick_size, rng=self.rng)
+
+        self.mid = float(S0)
+        self.prices = [float(S0)]
+        self.log_returns = []
+
+        self.base_spread_ticks = int(base_spread_ticks)
+
+    def best_bid(self):
+        return self.book.best_bid()
+
+    def best_ask(self):
+        return self.book.best_ask()
+
+    def spread(self):
+        return self.book.spread()
+
+    def place_limit(self, agent_id, side, price, qty, ttl=1):
+        return self.book.add_limit(agent_id=agent_id, side=side, price=price, qty=qty, ttl=ttl)
+
+    def place_market(self, agent_id, side, qty):
+        return self.book.add_market(agent_id=agent_id, side=side, qty=qty)
+
+    def cancel(self, order_id):
+        return self.book.cancel(order_id)
+
+    def end_step(self):
+        if self.book.last_trade_price is not None:
+            new_price = float(self.book.last_trade_price)
+        else:
+            new_price = float(self.book.mid_price(self.mid))
+
+        new_price = float(max(new_price, 1e-8))
+        r = float(np.log(new_price / self.mid))
+        self.mid = new_price
+        self.prices.append(self.mid)
+        self.log_returns.append(r)
+
+        self.book.last_trade_price = None
+        self.book.last_trade_ticks = None
+
+        self.book.step_time()
+
+
+
+    def realized_sigma(self, window=50):
+        lr = np.array(self.log_returns[-int(window):], dtype=float)
+        if lr.size < 2:
+            return 0.0
+        return float(np.std(lr) / np.sqrt(self.dt))
+
+    def recent_momentum(self, window):
+        w = int(window)
+        if len(self.log_returns) < w:
+            return 0.0
+        return float(np.mean(self.log_returns[-w:]))
+
+    def recent_vol(self, window):
+        w = int(window)
+        if len(self.log_returns) < w:
+            return 0.0
+        return float(np.std(self.log_returns[-w:]) / np.sqrt(self.dt))
