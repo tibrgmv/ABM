@@ -39,6 +39,13 @@ class LimitOrderBook:
         self.trades_in_step = 0
         self.volume_in_step = 0
 
+        # logs ======
+        self.n_limit_in_step = 0
+        self.n_market_in_step = 0
+        self.n_cancel_in_step = 0
+        self.n_expire_in_step = 0
+        self.crossed_in_step = 0
+
     def _insert_price(self, side, p):
         if side == "buy":
             if p in self.bids:
@@ -115,6 +122,8 @@ class LimitOrderBook:
         o = self.orders.pop(oid, None)
         if o is None:
             return False
+        
+        self.n_cancel_in_step += 1
         book = self.bids if o.side == "buy" else self.asks
         prices = self.bid_prices if o.side == "buy" else self.ask_prices
         if o.price_ticks is None:
@@ -130,12 +139,41 @@ class LimitOrderBook:
                 prices.pop(i)
             del book[o.price_ticks]
         return True
+    
+    def cancel_one_at_best(self, side):
+        if side == "buy":
+            p = self.best_bid_ticks()
+            if p is None:
+                return False
+            q = self.bids.get(p)
+        else:
+            p = self.best_ask_ticks()
+            if p is None:
+                return False
+            q = self.asks.get(p)
+
+        if q is None:
+            return False
+
+        while len(q) > 0:
+            oid = q[0]
+            o = self.orders.get(oid)
+            if o is None or o.qty <= 0:
+                q.popleft()
+                continue
+            return bool(self.cancel(oid))
+
+        self._remove_price_if_empty("buy" if side == "buy" else "sell", p)
+        return False
+
 
     def add_limit(self, agent_id, side, price, qty, ttl=1):
         side = "buy" if side == "buy" else "sell"
         qty = int(qty)
         if qty <= 0:
             return None
+                
+        self.n_limit_in_step += 1
         price_ticks = int(round(float(price) / self.tick_size))
         oid = next(self._oid)
         o = Order(oid=oid, agent_id=int(agent_id), side=side, qty=qty, price_ticks=price_ticks, t=self.t, ttl=int(ttl))
@@ -157,6 +195,8 @@ class LimitOrderBook:
         qty = int(qty)
         if qty <= 0:
             return None
+        
+        self.n_market_in_step += 1
         oid = next(self._oid)
         o = Order(oid=oid, agent_id=int(agent_id), side=side, qty=qty, price_ticks=None, t=self.t, ttl=0)
         if o.ttl > 0:
@@ -216,6 +256,11 @@ class LimitOrderBook:
             
             self.trades_in_step += 1
             self.volume_in_step += float(traded)
+
+            bb = self.best_bid_ticks()
+            ba = self.best_ask_ticks()
+            if bb is not None and ba is not None and bb >= ba:
+                self.crossed_in_step += 1
             # self.last_trade_price = incoming.price_ticks
 
     def step_time(self):
@@ -223,11 +268,24 @@ class LimitOrderBook:
         bucket = self.expire_buckets.pop(self.t, None)
         if bucket:
             for oid in bucket:
+                self.n_expire_in_step += 1
                 self.cancel(oid)
 
     def reset_step_counters(self):
         self.trades_in_step = 0
         self.volume_in_step = 0.0
+        self.n_limit_in_step = 0
+        self.n_market_in_step = 0
+        self.n_cancel_in_step = 0
+        self.n_expire_in_step = 0
+        self.crossed_in_step = 0
+
+    def depth_at_best(self):
+        bb = self.best_bid_ticks()
+        ba = self.best_ask_ticks()
+        db = self._level_qty("buy", bb) if bb is not None else 0.0
+        da = self._level_qty("sell", ba) if ba is not None else 0.0
+        return float(db), float(da)
 
     def _level_qty(self, side, price_ticks):
         book = self.bids if side == "buy" else self.asks
@@ -241,15 +299,7 @@ class LimitOrderBook:
                 s += o.qty
         return float(s)
 
-    def depth_at_best(self):
-        bb = self.best_bid_ticks()
-        ba = self.best_ask_ticks()
-        db = self._level_qty("buy", bb) if bb is not None else 0.0
-        da = self._level_qty("sell", ba) if ba is not None else 0.0
-        return float(db), float(da)
-
-
-
+    
     def snapshot_l2(self, depth=10):
         bid_ticks = sorted(self.bid_prices, reverse=True)[:depth]
         ask_ticks = sorted(self.ask_prices)[:depth]
@@ -298,6 +348,7 @@ class LOBMarket:
 
         new_price = float(max(new_price, 1e-8))
         r = float(np.log(new_price / self.mid))
+        
         self.mid = new_price
         self.prices.append(self.mid)
         self.log_returns.append(r)

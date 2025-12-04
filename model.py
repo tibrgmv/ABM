@@ -37,6 +37,7 @@ class ABMModel(Model):
         self.rng = np.random.default_rng(int(seed))
         self.steps_n = int(steps)
         self.dt = float(dt)
+        self.n_mm = int(n_mm)
 
         self.tick_size = float(tick_size)
 
@@ -69,11 +70,52 @@ class ABMModel(Model):
         self.imbalance_log = []
         self.trade_count_log = []
         self.volume_log = []
+        self.mm_requotes_log = []
+        self.mm_requotes_in_step = 0
 
         self.meta_left = 0
         self.meta_side = "sell"
         self.meta_intensity = 0
 
+        self.hawkes_mu = float(cfg.get("hawkes_mu", 200.0))
+        self.hawkes_alpha = float(cfg.get("hawkes_alpha", 0.5))
+        self.hawkes_beta = float(cfg.get("hawkes_beta", 5.0))
+        self.hawkes_H = 0.0
+        self.max_events = int(cfg.get("max_events", 3000))
+
+        self.xi_wr = float(cfg.get("xi_wr", 1.0))
+        self.xi_ws = float(cfg.get("xi_ws", 1.0))
+        self.xi_wI = float(cfg.get("xi_wI", 1.0))
+        self.theta_r = float(cfg.get("theta_r", 3.0))
+        self.theta_s = float(cfg.get("theta_s", 3.0 * self.tick_size))
+        self.theta_I = float(cfg.get("theta_I", 0.5))
+
+        # debug ======
+        self.debug = bool(cfg.get("debug", False))
+        self.debug_print_every = int(cfg.get("debug_print_every", 0))
+        self.debug_snapshot_every = int(cfg.get("debug_snapshot_every", 0))
+        self.debug_l2_depth = int(cfg.get("debug_l2_depth", 10))
+        self.n_events_log = []
+        self.Nn_log = []
+        self.lambda_log = []
+        self.lambda_reg_log = []
+        self.hawkes_H_log = []
+        self.hawkes_cap_hit_log = []
+        self.bb_none_log = []
+        self.ba_none_log = []
+        self.order_count_log = []
+        self.bid_levels_log = []
+        self.ask_levels_log = []
+        self.crossed_log = []
+        self.n_limit_log = []
+        self.n_market_log = []
+        self.n_cancel_log = []
+        self.n_expire_log = []
+        self.meta_active_log = []
+        self.meta_left_log = []
+        self.meta_intensity_log = []
+        self.meta_side_log = []
+        self.l2_snapshots = []
 
 
         uid = 0
@@ -95,10 +137,21 @@ class ABMModel(Model):
 
     def update_regime(self):
         last_r = self.market.log_returns[-1] if len(self.market.log_returns) else 0.0
-        shock_trigger = 1.0 if last_r < -3.0 * self.market.realized_sigma(window=50) * self.dt**0.5 else 0.0
+        bb = self.market.book.best_bid()
+        ba = self.market.book.best_ask()
+
+        spread = float(ba - bb) if (bb is not None and ba is not None) else 0.0
+        depth_bid, depth_ask = self.market.book.depth_at_best()
+        imb = (depth_bid - depth_ask) / max(1.0, depth_bid + depth_ask)
+
+        r_flag = 1.0 if last_r < -self.theta_r * self.market.realized_sigma(window=50) * self.dt**0.5 else 0.0
+        s_flag = 1.0 if spread > self.theta_s else 0.0
+        I_flag = 1.0 if abs(imb) > self.theta_I else 0.0
+
+        shock_trigger = self.xi_wr * r_flag + self.xi_ws * s_flag + self.xi_wI * I_flag
 
         if self.regime == 0:
-            p = min(1.0, self.p01 * (1.0 + 5.0 * shock_trigger))
+            p = min(1.0, self.p01 * (1.0 + shock_trigger))
             if float(self.rng.uniform()) < p:
                 self.regime = 1
         else:
@@ -111,10 +164,29 @@ class ABMModel(Model):
         self.update_regime()
         self.maybe_shock()
 
-        n_events = self.n_events_stress if self.regime == 1 else self.n_events_calm
+        self.mm_requotes_in_step = 0
+
+        base_scale = self.n_events_calm if self.regime == 0 else self.n_events_stress
+        Lambda = self.hawkes_mu + self.hawkes_alpha * self.hawkes_H
+        Lambda_reg = Lambda * (base_scale / max(1.0, self.n_events_calm))
+
+        Nn = int(self.rng.poisson(Lambda_reg * self.dt))
+        n_events = min(self.max_events, max(1, Nn))
+
+        # debug =======
+        self.n_events_log.append(int(n_events))
+        self.Nn_log.append(int(Nn))
+        self.lambda_log.append(float(Lambda))
+        self.lambda_reg_log.append(float(Lambda_reg))
+        self.hawkes_H_log.append(float(self.hawkes_H))
+        self.hawkes_cap_hit_log.append(int(Nn >= self.max_events))
+
+
+        for i in range(self.n_mm):
+            self.agents_list[i].step()
 
         for _ in range(n_events):
-            a = self.agents_list[int(self.rng.integers(0, len(self.agents_list)))]
+            a = self.agents_list[int(self.rng.integers(self.n_mm, len(self.agents_list)))]
             a.step()
 
         if self.market.book.t == 200:
@@ -136,6 +208,7 @@ class ABMModel(Model):
         depth_bid, depth_ask = self.market.book.depth_at_best()
         imb = (depth_bid - depth_ask) / max(1.0, depth_bid + depth_ask)
 
+        # debug ==================
         self.regime_log.append(int(self.regime))
         self.spread_log.append(spread)
         self.depth_bid_log.append(float(depth_bid))
@@ -144,7 +217,50 @@ class ABMModel(Model):
         self.trade_count_log.append(int(self.market.book.trades_in_step))
         self.volume_log.append(float(self.market.book.volume_in_step))
 
+        self.bb_none_log.append(int(bb is None))
+        self.ba_none_log.append(int(ba is None))
+        self.order_count_log.append(int(len(self.market.book.orders)))
+        self.bid_levels_log.append(int(len(self.market.book.bid_prices)))
+        self.ask_levels_log.append(int(len(self.market.book.ask_prices)))
+        self.crossed_log.append(int(self.market.book.crossed_in_step > 0))
+
+        self.mm_requotes_log.append(int(self.mm_requotes_in_step))
+
+        self.n_limit_log.append(int(self.market.book.n_limit_in_step))
+        self.n_market_log.append(int(self.market.book.n_market_in_step))
+        self.n_cancel_log.append(int(self.market.book.n_cancel_in_step))
+        self.n_expire_log.append(int(self.market.book.n_expire_in_step))
+
+        self.meta_active_log.append(int(self.meta_left > 0))
+        self.meta_left_log.append(int(self.meta_left))
+        self.meta_intensity_log.append(int(self.meta_intensity))
+        self.meta_side_log.append(1 if self.meta_side == "buy" else -1)
+
+        if self.debug_snapshot_every > 0 and (self.market.book.t % self.debug_snapshot_every == 0):
+            bids, asks = self.market.book.snapshot_l2(depth=self.debug_l2_depth)
+            self.l2_snapshots.append((int(self.market.book.t), float(self.current_price), bids, asks))
+        # ========================
+
+
         self.market.book.reset_step_counters()
+
+        self.hawkes_H = np.exp(-self.hawkes_beta * self.dt) * self.hawkes_H + float(n_events)
+
+        if self.debug_print_every > 0 and (self.market.book.t % self.debug_print_every == 0):
+            print(
+                "t", self.market.book.t,
+                "reg", self.regime,
+                "mid", round(self.current_price, 4),
+                "spread", round(self.spread_log[-1], 4),
+                "bb_none/ba_none", self.bb_none_log[-1], self.ba_none_log[-1],
+                "orders", self.order_count_log[-1],
+                "events", n_events,
+                "limits/mkt/cxl/exp", self.n_limit_log[-1], self.n_market_log[-1], self.n_cancel_log[-1], self.n_expire_log[-1],
+                "mm_requote", self.mm_requotes_log[-1],
+                "crossed", self.crossed_log[-1]
+            )
+
+
 
 
     def maybe_shock(self):

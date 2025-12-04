@@ -82,31 +82,67 @@ class NoiseTrader(Agent):
 
 
 class MarketMaker(Agent):
-    def __init__(self, uid, model, base_spread_ticks=2, size=10, ttl=10, levels=5):
+    def __init__(self, uid, model, base_spread_ticks=2, size=10, ttl=10, levels=5, requote_move_ticks=2):
         super().__init__(model)
         self.base_spread_ticks = int(base_spread_ticks)
         self.size = int(size)
         self.ttl = int(ttl)
-        self.levels = int(levels)
         self.live = []
+        self.levels = int(levels)
+        self.requote_move_ticks = int(requote_move_ticks)
+        self.last_mid_ticks = None
 
     def step(self):
-        for oid in self.live:
-            self.model.market.cancel(oid)
-        self.live.clear()
+        book_orders = self.model.market.book.orders
+        self.live = [oid for oid in self.live if (oid in book_orders and book_orders[oid].qty > 0)]
 
         reg = int(self.model.regime)
         mid = self.model.market.book.mid_price(self.model.market.mid)
-
         tick = float(self.model.tick_size)
+
+        mid_ticks = int(round(mid / tick))
+
+        bb = self.model.market.book.best_bid_ticks()
+        ba = self.model.market.book.best_ask_ticks()
+
+        # реквот если:
+        # - первый раз
+        # - mid уехал на ≥ threshold
+        # - стакан пустой/разорванный
+        # - в стрессе можно делать threshold меньше (быстрее реагировать)
+        thr = max(1, self.requote_move_ticks - (1 if reg == 1 else 0))
+        db, da = self.model.market.book.depth_at_best()
+        desired_levels = max(1, self.levels - (2 if reg == 1 else 0))
+
+
+        need_requote = False
+        if self.last_mid_ticks is None:
+            need_requote = True
+        elif abs(mid_ticks - self.last_mid_ticks) >= thr:
+            need_requote = True
+        elif bb is None or ba is None:
+            need_requote = True
+        elif db == 0.0 or da == 0.0:
+            need_requote = True
+        elif len(self.live) < 2 * desired_levels:
+            need_requote = True
+        if not need_requote:
+            return
+
+        self.last_mid_ticks = mid_ticks
+        
+        self.model.mm_requotes_in_step += 1
+
+        for oid in self.live:
+            self.model.market.cancel(oid)
+        self.live.clear()
 
         spread = self.base_spread_ticks + (3 if reg == 1 else 0)
         levels = max(1, self.levels - (2 if reg == 1 else 0))
         base_size = max(1, self.size // (2 if reg == 1 else 1))
 
-        m = mid / tick
-        bid0 = int(m) - spread
-        ask0 = int(m) + spread
+        bid0 = mid_ticks - spread
+        ask0 = mid_ticks + spread
 
         for L in range(levels):
             q = max(1, base_size // (L + 1))
