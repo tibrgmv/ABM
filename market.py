@@ -34,6 +34,7 @@ class LimitOrderBook:
         self.last_trade_price = None
         self.last_trade_ticks = None
 
+        self.trade_happened = False
         self.trades = []
         self.t = 0
         self.trades_in_step = 0
@@ -117,28 +118,34 @@ class LimitOrderBook:
         self.last_trade_price = px
         self.last_trade_ticks = int(price_ticks)
         self.trades.append((self.t, px, int(qty), int(passive_agent_id), int(aggressive_agent_id)))
+        self.trade_happened = True
 
-    def cancel(self, oid):
+    def _drop_order(self, oid):
         o = self.orders.pop(oid, None)
-        if o is None:
-            return False
-        
-        self.n_cancel_in_step += 1
+        if o is None: return False
+        if o.price_ticks is None: return True
+
         book = self.bids if o.side == "buy" else self.asks
         prices = self.bid_prices if o.side == "buy" else self.ask_prices
-        if o.price_ticks is None:
-            return True
+
         q = book.get(o.price_ticks)
-        if q is None:
-            return True
-        newq = deque([x for x in q if x != oid])
-        book[o.price_ticks] = newq
-        if len(newq) == 0:
-            i = bisect_left(prices, o.price_ticks)
-            if i < len(prices) and prices[i] == o.price_ticks:
-                prices.pop(i)
-            del book[o.price_ticks]
+        if q is not None:
+            try:
+                q.remove(oid)
+            except ValueError:
+                pass
+            if len(q) == 0:
+                del book[o.price_ticks]
+                i = bisect_left(prices, o.price_ticks)
+                if i < len(prices) and prices[i] == o.price_ticks:
+                    prices.pop(i)
         return True
+
+    def cancel(self, oid):
+        if oid not in self.orders:
+            return False
+        self.n_cancel_in_step += 1
+        return bool(self._drop_order(oid))
     
     def cancel_one_at_best(self, side):
         if side == "buy":
@@ -234,8 +241,8 @@ class LimitOrderBook:
                 resting.qty -= traded
                 self._record_trade(best_ask, traded, resting.agent_id, incoming.agent_id)
                 if resting.qty == 0:
-                    self.cancel(oid)
-                self._remove_price_if_empty("sell", best_ask)
+                    self._drop_order(oid)
+
             else:
                 best_bid = self.best_bid_ticks()
                 if best_bid is None:
@@ -251,8 +258,7 @@ class LimitOrderBook:
                 resting.qty -= traded
                 self._record_trade(best_bid, traded, resting.agent_id, incoming.agent_id)
                 if resting.qty == 0:
-                    self.cancel(oid)
-                self._remove_price_if_empty("buy", best_bid)
+                    self._drop_order(oid)
             
             self.trades_in_step += 1
             self.volume_in_step += float(traded)
@@ -269,7 +275,7 @@ class LimitOrderBook:
         if bucket:
             for oid in bucket:
                 self.n_expire_in_step += 1
-                self.cancel(oid)
+                self._drop_order(oid)
 
     def reset_step_counters(self):
         self.trades_in_step = 0
@@ -279,6 +285,8 @@ class LimitOrderBook:
         self.n_cancel_in_step = 0
         self.n_expire_in_step = 0
         self.crossed_in_step = 0
+        self.trade_happened = False
+
 
     def depth_at_best(self):
         bb = self.best_bid_ticks()
@@ -348,7 +356,7 @@ class LOBMarket:
 
         new_price = float(max(new_price, 1e-8))
         r = float(np.log(new_price / self.mid))
-        
+
         self.mid = new_price
         self.prices.append(self.mid)
         self.log_returns.append(r)
@@ -377,3 +385,9 @@ class LOBMarket:
         if len(self.log_returns) < w:
             return 0.0
         return float(np.std(self.log_returns[-w:]) / np.sqrt(self.dt))
+    
+    def mark_to_market(self):
+        if self.book.last_trade_price is not None:
+            self.mid = float(self.book.last_trade_price)
+        else:
+            self.mid = float(self.book.mid_price(self.mid))

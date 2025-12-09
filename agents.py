@@ -82,7 +82,7 @@ class NoiseTrader(Agent):
 
 
 class MarketMaker(Agent):
-    def __init__(self, uid, model, base_spread_ticks=2, size=10, ttl=10, levels=5, requote_move_ticks=2):
+    def __init__(self, uid, model, base_spread_ticks=2, size=10, ttl=10, levels=5, requote_move_ticks=5, ttl_jitter=0):
         super().__init__(model)
         self.base_spread_ticks = int(base_spread_ticks)
         self.size = int(size)
@@ -91,6 +91,7 @@ class MarketMaker(Agent):
         self.levels = int(levels)
         self.requote_move_ticks = int(requote_move_ticks)
         self.last_mid_ticks = None
+        self.ttl_jitter = int(ttl_jitter)
 
     def step(self):
         book_orders = self.model.market.book.orders
@@ -130,13 +131,10 @@ class MarketMaker(Agent):
             return
 
         self.last_mid_ticks = mid_ticks
-        
+
         self.model.mm_requotes_in_step += 1
 
-        for oid in self.live:
-            self.model.market.cancel(oid)
-        self.live.clear()
-
+        # remove all outside ===== 
         spread = self.base_spread_ticks + (3 if reg == 1 else 0)
         levels = max(1, self.levels - (2 if reg == 1 else 0))
         base_size = max(1, self.size // (2 if reg == 1 else 1))
@@ -144,13 +142,50 @@ class MarketMaker(Agent):
         bid0 = mid_ticks - spread
         ask0 = mid_ticks + spread
 
+        book_orders = self.model.market.book.orders
+
+        new_live = []
+        buy_ticks = set()
+        sell_ticks = set()
+
+        for oid in self.live:
+            o = book_orders.get(oid)
+            if o is None or o.qty <= 0 or o.price_ticks is None:
+                continue
+
+            pt = int(o.price_ticks)
+            if o.side == "buy":
+                if pt < bid0 - (levels - 1) or pt > bid0:
+                    self.model.market.cancel(oid)
+                else:
+                    buy_ticks.add(pt)
+                    new_live.append(oid)
+            else:
+                if pt < ask0 or pt > ask0 + (levels - 1):
+                    self.model.market.cancel(oid)
+                else:
+                    sell_ticks.add(pt)
+                    new_live.append(oid)
+
+        self.live = new_live
+
+
         for L in range(levels):
             q = max(1, base_size // (L + 1))
-            bid = (bid0 - L) * tick
-            ask = (ask0 + L) * tick
-            oidb = self.model.market.place_limit(self.unique_id, "buy", bid, q, ttl=self.ttl)
-            oida = self.model.market.place_limit(self.unique_id, "sell", ask, q, ttl=self.ttl)
-            if oidb is not None:
-                self.live.append(oidb)
-            if oida is not None:
-                self.live.append(oida)
+
+            bid_ticks_L = bid0 - L
+            ask_ticks_L = ask0 + L
+            ttl = self.ttl + int(self.model.rng.integers(0, self.ttl_jitter + 1))
+
+            if bid_ticks_L not in buy_ticks:
+                bid = bid_ticks_L * tick
+                oidb = self.model.market.place_limit(self.unique_id, "buy", bid, q, ttl=ttl)
+                if oidb is not None:
+                    self.live.append(oidb)
+
+            if ask_ticks_L not in sell_ticks:
+                ask = ask_ticks_L * tick
+                oida = self.model.market.place_limit(self.unique_id, "sell", ask, q, ttl=ttl)
+                if oida is not None:
+                    self.live.append(oida)
+

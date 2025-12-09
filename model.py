@@ -73,6 +73,13 @@ class ABMModel(Model):
         self.mm_requotes_log = []
         self.mm_requotes_in_step = 0
 
+        # MM reaction parameters ==== 
+        self.mm_react_prob = float(cfg.get("mm_react_prob", 0.6))
+        self.mm_latency_events = int(cfg.get("mm_latency_events", 2))
+        self._mm_pending = 0
+        self.mm_react_log = []
+
+
         self.meta_left = 0
         self.meta_side = "sell"
         self.meta_intensity = 0
@@ -96,6 +103,7 @@ class ABMModel(Model):
         self.debug_snapshot_every = int(cfg.get("debug_snapshot_every", 0))
         self.debug_l2_depth = int(cfg.get("debug_l2_depth", 10))
         self.n_events_log = []
+        self.mid_micro_log = []
         self.Nn_log = []
         self.lambda_log = []
         self.lambda_reg_log = []
@@ -120,7 +128,7 @@ class ABMModel(Model):
 
         uid = 0
         for _ in range(int(n_mm)):
-            self.agents_list.append(MarketMaker(uid, self, base_spread_ticks=base_spread_ticks, size=mm_size, ttl=5))
+            self.agents_list.append(MarketMaker(uid, self, base_spread_ticks=base_spread_ticks, size=mm_size, ttl=5, ttl_jitter=5))
             uid += 1
 
         for _ in range(int(n_fund)):
@@ -185,16 +193,54 @@ class ABMModel(Model):
         for i in range(self.n_mm):
             self.agents_list[i].step()
 
-        for _ in range(n_events):
+        mm_reacts_this_step = 0
+        for k in range(n_events):
             a = self.agents_list[int(self.rng.integers(self.n_mm, len(self.agents_list)))]
             a.step()
+
+            trade_now = self.market.book.trade_happened
+            if trade_now:
+                self.market.mark_to_market()
+                self.current_price = float(self.market.mid)
+
+                # --- micro mid log  ---------------------
+                bb = self.market.book.best_bid()
+                ba = self.market.book.best_ask()
+                t_micro = float(self.market.book.t) + (k + 1) / (n_events + 1)
+
+                if bb is not None and ba is not None:
+                    mid_q = 0.5 * (float(bb) + float(ba))
+                else:
+                    mid_q = float(self.market.mid)
+
+                self.mid_micro_log.append((t_micro, mid_q))
+                # ------------------------------------------
+
+                if self._mm_pending <= 0 and float(self.rng.uniform()) < self.mm_react_prob:
+                    self._mm_pending = self.mm_latency_events
+                else:
+                    self._mm_pending = min(self._mm_pending, 1)
+
+                self.market.book.trade_happened = False
+
+
+            if self._mm_pending > 0:
+                self._mm_pending -= 1
+                if self._mm_pending == 0:
+                    for i in range(self.n_mm):
+                        self.agents_list[i].step()
+                    mm_reacts_this_step += 1
+
+        self.mm_react_log.append(int(mm_reacts_this_step))
+
 
         if self.market.book.t == 200:
             bb = self.market.book.best_bid()
             ba = self.market.book.best_ask()
             sp = self.market.spread()
             db, da = self.market.book.depth_at_best()
-            print("t=", self.market.book.t, "bb/ba/sp=", bb, ba, sp, "depth=", db, da, "trades_step=", self.market.book.trades_in_step)
+            # print("t=", self.market.book.t, "bb/ba/sp=", bb, ba, sp, "depth=", db, da, "trades_step=", self.market.book.trades_in_step)
+            print(f't={self.market.book.t}  bb={bb:.2f}  ba={ba:.2f}  sp={sp:.3f}  db={db:.2f}  da={da:.2f}  trades_step={self.market.book.trades_in_step}')
 
 
         self.market.end_step()
@@ -204,6 +250,7 @@ class ABMModel(Model):
         bb = self.market.book.best_bid()
         ba = self.market.book.best_ask()
         spread = float(ba - bb) if (bb is not None and ba is not None) else float("nan")
+
 
         depth_bid, depth_ask = self.market.book.depth_at_best()
         imb = (depth_bid - depth_ask) / max(1.0, depth_bid + depth_ask)
@@ -261,8 +308,6 @@ class ABMModel(Model):
             )
 
 
-
-
     def maybe_shock(self):
         if self.meta_left <= 0:
             if float(self.rng.uniform()) >= self.shock_rate:
@@ -277,8 +322,6 @@ class ABMModel(Model):
             self.market.place_market(agent_id=-777, side=self.meta_side, qty=q)
 
         self.meta_left -= 1
-
-
 
 
     def run(self):

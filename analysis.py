@@ -27,6 +27,20 @@ def bs_price_put(S0, K, r, sigma, T):
     return float(K * np.exp(-r * T) * norm.cdf(-d2) - S0 * norm.cdf(-d1))
 
 
+def bs_delta_call(S, K, r, sigma, T):
+    S = float(S)
+    K = float(K)
+    r = float(r)
+    sigma = float(sigma)
+    T = float(T)
+    if T <= 0 or sigma <= 0:
+        return 1.0 if S > K else 0.0
+    d1 = (np.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * np.sqrt(T))
+    return float(norm.cdf(d1))
+
+def bs_delta_put(S, K, r, sigma, T):
+    return float(bs_delta_call(S, K, r, sigma, T) - 1.0)
+
 def sample_positive_stable(alpha, size, rng):
     alpha = float(alpha)
     U = rng.uniform(0.0, np.pi, size=size)
