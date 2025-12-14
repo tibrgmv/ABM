@@ -17,7 +17,8 @@ class Fundamentalist(Agent):
     def step(self):
         S = float(self.model.current_price)
         F = float(self.model.fundamental_price)
-        eps = float(self.model.rng.normal(0.0, 1.0))
+        eps = float(self.model.rng.normal(0.0, 1.0))    # noise
+
         signal = self.strength * (F - S) / max(S, 1e-12) + self.noise_scale * eps
         qty = int(min(self.max_qty, max(1, round(abs(signal) * self.max_qty))))
         side = "buy" if signal > 0 else "sell"
@@ -36,9 +37,10 @@ class Chartist(Agent):
         self.uid = uid
 
     def step(self):
-        mom = float(self.model.market.recent_momentum(self.mom_window))
-        v = float(self.model.market.recent_vol(self.vol_window))
+        mom = float(self.model.market.recent_momentum(self.mom_window))     # mom > 0 => uptrend, mom < 0 => downtrend
+        v = float(self.model.market.recent_vol(self.vol_window))            # recent volatility
         eps = float(self.model.rng.normal(0.0, 1.0))
+
         signal = self.strength * mom * (1.0 + self.vol_sens * v) + self.noise_scale * eps
         qty = int(min(self.max_qty, max(1, round(abs(signal) * self.max_qty))))
         side = "buy" if signal > 0 else "sell"
@@ -61,23 +63,25 @@ class NoiseTrader(Agent):
         if float(self.model.rng.uniform()) > self.prob:
             return
 
+        # if in stress regime, increase sell bias
         reg = int(self.model.regime)
         sell_bias = min(0.95, self.sell_bias + 0.20 * reg)
         side = "sell" if float(self.model.rng.uniform()) < sell_bias else "buy"
 
+        # determine quantity from Pareto distribution
         qty = pareto_int(self.model.rng, self.xm, self.alpha, self.cap)
 
+        # decide limit vs market order
         mid = float(self.model.current_price)
         tick = float(self.model.tick_size)
         off = float(self.limit_offset_ticks + reg) * tick
-
         limit_prob = 0.85 if reg == 0 else 0.35
+
         if float(self.model.rng.uniform()) < limit_prob:
             px = mid - off if side == "buy" else mid + off
             self.model.market.place_limit(self.unique_id, side, px, qty, ttl=self.ttl)
         else:
             self.model.market.place_market(self.unique_id, side, qty)
-
 
 
 
@@ -94,47 +98,40 @@ class MarketMaker(Agent):
         self.ttl_jitter = int(ttl_jitter)
 
     def step(self):
+        # clean live orders ===============================================
         book_orders = self.model.market.book.orders
         self.live = [oid for oid in self.live if (oid in book_orders and book_orders[oid].qty > 0)]
 
         reg = int(self.model.regime)
         mid = self.model.market.book.mid_price(self.model.market.mid)
         tick = float(self.model.tick_size)
-
         mid_ticks = int(round(mid / tick))
-
         bb = self.model.market.book.best_bid_ticks()
         ba = self.model.market.book.best_ask_ticks()
-
-        # реквот если:
-        # - первый раз
-        # - mid уехал на ≥ threshold
-        # - стакан пустой/разорванный
-        # - в стрессе можно делать threshold меньше (быстрее реагировать)
-        thr = max(1, self.requote_move_ticks - (1 if reg == 1 else 0))
         db, da = self.model.market.book.depth_at_best()
-        desired_levels = max(1, self.levels - (2 if reg == 1 else 0))
 
+        desired_levels = max(1, self.levels - (2 if reg == 1 else 0)) # in stress keep fewer levels
+        thr = max(1, self.requote_move_ticks - (1 if reg == 1 else 0)) # in stress react faster
 
+        # decide if requote is needed ===============================================
         need_requote = False
-        if self.last_mid_ticks is None:
+        if self.last_mid_ticks is None:                     # first time
             need_requote = True
-        elif abs(mid_ticks - self.last_mid_ticks) >= thr:
+        elif abs(mid_ticks - self.last_mid_ticks) >= thr:   # mid moved enough
             need_requote = True
-        elif bb is None or ba is None:
+        elif bb is None or ba is None:                      # no best bid or ask
             need_requote = True
-        elif db == 0.0 or da == 0.0:
+        elif db == 0.0 or da == 0.0:                        # no depth at best
             need_requote = True
-        elif len(self.live) < 2 * desired_levels:
+        elif len(self.live) < 2 * desired_levels:           # not enough levels
             need_requote = True
         if not need_requote:
             return
 
         self.last_mid_ticks = mid_ticks
-
         self.model.mm_requotes_in_step += 1
 
-        # remove all outside ===== 
+        # remove quotes outside desired grid ========================================
         spread = self.base_spread_ticks + (3 if reg == 1 else 0)
         levels = max(1, self.levels - (2 if reg == 1 else 0))
         base_size = max(1, self.size // (2 if reg == 1 else 1))
@@ -169,7 +166,7 @@ class MarketMaker(Agent):
 
         self.live = new_live
 
-
+        # place new quotes to fill the grid ========================================
         for L in range(levels):
             q = max(1, base_size // (L + 1))
 

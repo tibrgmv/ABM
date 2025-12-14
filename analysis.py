@@ -5,19 +5,32 @@ from scipy.stats import norm, ttest_rel, wilcoxon, ks_2samp
 from model import ABMModel
 
 
+# Black-Scholes pricing CALL =======================================================
 def bs_price_call(S0, K, r, sigma, T):
-    S0 = float(S0); K = float(K); r = float(r); sigma = float(sigma); T = float(T)
+    S0 = float(S0)
+    K = float(K)
+    r = float(r)
+    sigma = float(sigma)
+    T = float(T)
+
     if T <= 0:
         return max(S0 - K, 0.0)
     if sigma <= 0:
         return max(S0 - K * np.exp(-r * T), 0.0)
+    
     d1 = (np.log(S0 / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
+
     return float(S0 * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2))
 
 
+# Black-Scholes pricing PUT ========================================================
 def bs_price_put(S0, K, r, sigma, T):
-    S0 = float(S0); K = float(K); r = float(r); sigma = float(sigma); T = float(T)
+    S0 = float(S0)
+    K = float(K)
+    r = float(r)
+    sigma = float(sigma)
+    T = float(T)
     if T <= 0:
         return max(K - S0, 0.0)
     if sigma <= 0:
@@ -27,20 +40,29 @@ def bs_price_put(S0, K, r, sigma, T):
     return float(K * np.exp(-r * T) * norm.cdf(-d2) - S0 * norm.cdf(-d1))
 
 
+# Black-Scholes DELTA CALL =================================================================
 def bs_delta_call(S, K, r, sigma, T):
     S = float(S)
     K = float(K)
     r = float(r)
     sigma = float(sigma)
     T = float(T)
+
     if T <= 0 or sigma <= 0:
         return 1.0 if S > K else 0.0
     d1 = (np.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * np.sqrt(T))
+
     return float(norm.cdf(d1))
 
+# Black-Scholes DELTA PUT ==============================================================
 def bs_delta_put(S, K, r, sigma, T):
     return float(bs_delta_call(S, K, r, sigma, T) - 1.0)
 
+
+# Sample positive stable random variables ==============================================
+# генерирует положительные “кривые” случайные числа, которые потом используются чтобы сделать случайное 
+# время в симуляции — поэтому траектории становятся более похожими на рынок (периоды спокойствия + редкие 
+# сильные движения).
 def sample_positive_stable(alpha, size, rng):
     alpha = float(alpha)
     U = rng.uniform(0.0, np.pi, size=size)
@@ -50,16 +72,21 @@ def sample_positive_stable(alpha, size, rng):
     return part1 * part2
 
 
+# TF ractional CALL option pricing via Monte Carlo =====================================
+# моделируем BS-геометрию но вместо обычного времени T используем случайное “эффективное время” E
 def fractional_price_call_mc(S0, K, r, sigma, T, alpha, n_mc, seed):
     rng = np.random.default_rng(seed)
     S = sample_positive_stable(alpha, n_mc, rng)
+
     E = (T / np.maximum(S, 1e-16)) ** alpha
+
     Z = rng.normal(0.0, 1.0, size=n_mc)
     ST = S0 * np.exp((r - 0.5 * sigma * sigma) * E + sigma * np.sqrt(E) * Z)
     payoff = np.maximum(ST - K, 0.0)
     return float(np.exp(-r * T) * np.mean(payoff))
 
 
+# Fractional PUT option pricing via Monte Carlo ========================================
 def fractional_price_put_mc(S0, K, r, sigma, T, alpha, n_mc, seed):
     rng = np.random.default_rng(seed)
     S = sample_positive_stable(alpha, n_mc, rng)
@@ -78,11 +105,11 @@ def run_abm_paths(cfg, n_paths, seed0):
     return np.array(paths, dtype=float)
 
 
+# Reference price via ABM paths =====================================================
 def reference_price_call(paths, K, r, T):
     ST = paths[:, -1]
     payoff = np.maximum(ST - float(K), 0.0)
     return float(np.exp(-float(r) * float(T)) * np.mean(payoff))
-
 
 def reference_price_put(paths, K, r, T):
     ST = paths[:, -1]
@@ -90,16 +117,39 @@ def reference_price_put(paths, K, r, T):
     return float(np.exp(-float(r) * float(T)) * np.mean(payoff))
 
 
+# Estimate sigma from ABM paths =====================================================
 def estimate_sigma(paths, dt):
+    paths = np.asarray(paths, dtype=float)
+    dt = float(dt)
+
+    if paths.ndim != 2:
+        raise ValueError("ABM paths must be a 2D array of shape (n_paths, n_steps+1).")
     if not np.all(np.isfinite(paths)) or np.min(paths) <= 0:
         raise ValueError("ABM paths contain non-positive or non-finite prices. Fix price dynamics first.")
     lr = np.diff(np.log(paths), axis=1)
-    s = float(np.std(lr) / np.sqrt(float(dt)))
+    if lr.shape[1] < 2:
+        raise ValueError("Not enough time steps to estimate sigma.")
+
+    # drop the first 10% of steps to avoid initial artifacts
+    start = int(0.1 * lr.shape[1])
+    lr_tail = lr[:, start:] if start < lr.shape[1] else lr
+    sigmas = np.std(lr_tail, axis=1) / np.sqrt(dt)
+    sigmas = sigmas[np.isfinite(sigmas) & (sigmas > 0)]
+
+    if sigmas.size == 0:
+        raise ValueError("Estimated sigma is non-positive/non-finite. Increase variability or fix returns.")
+
+    # median is robust to outliers
+    s = float(np.median(sigmas))
+
     if not np.isfinite(s) or s <= 0:
         raise ValueError("Estimated sigma is non-positive/non-finite. Increase variability or fix returns.")
+
     return s
 
 
+# =============================================== H1 Pricing ====================================================
+# =============================================== Experiment ====================================================
 def run_h1_pricing_experiment(
     cfg,
     dt,

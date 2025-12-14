@@ -55,6 +55,7 @@ class ABMModel(Model):
 
         self.agents_list = []
 
+        # Regime switching parameters ===========================
         self.regime = 0
         self.p01 = float(cfg.get("p01", 0.02))
         self.p10 = float(cfg.get("p10", 0.10))
@@ -63,33 +64,6 @@ class ABMModel(Model):
         self.n_events_calm = int(cfg.get("n_events_calm", 400))
         self.n_events_stress = int(cfg.get("n_events_stress", 1200))
 
-        self.regime_log = []
-        self.spread_log = []
-        self.depth_bid_log = []
-        self.depth_ask_log = []
-        self.imbalance_log = []
-        self.trade_count_log = []
-        self.volume_log = []
-        self.mm_requotes_log = []
-        self.mm_requotes_in_step = 0
-
-        # MM reaction parameters ==== 
-        self.mm_react_prob = float(cfg.get("mm_react_prob", 0.6))
-        self.mm_latency_events = int(cfg.get("mm_latency_events", 2))
-        self._mm_pending = 0
-        self.mm_react_log = []
-
-
-        self.meta_left = 0
-        self.meta_side = "sell"
-        self.meta_intensity = 0
-
-        self.hawkes_mu = float(cfg.get("hawkes_mu", 200.0))
-        self.hawkes_alpha = float(cfg.get("hawkes_alpha", 0.5))
-        self.hawkes_beta = float(cfg.get("hawkes_beta", 5.0))
-        self.hawkes_H = 0.0
-        self.max_events = int(cfg.get("max_events", 3000))
-
         self.xi_wr = float(cfg.get("xi_wr", 1.0))
         self.xi_ws = float(cfg.get("xi_ws", 1.0))
         self.xi_wI = float(cfg.get("xi_wI", 1.0))
@@ -97,7 +71,26 @@ class ABMModel(Model):
         self.theta_s = float(cfg.get("theta_s", 3.0 * self.tick_size))
         self.theta_I = float(cfg.get("theta_I", 0.5))
 
-        # debug ======
+        # MM reaction parameters ================================ 
+        self.mm_react_prob = float(cfg.get("mm_react_prob", 0.6))
+        self.mm_latency_events = int(cfg.get("mm_latency_events", 2))
+        self._mm_pending = 0
+        self.mm_react_log = []
+
+
+        # Metaorder parameters ==================================
+        self.meta_left = 0
+        self.meta_side = "sell"
+        self.meta_intensity = 0
+
+        # Hawkes process parameters ==============================
+        self.hawkes_mu = float(cfg.get("hawkes_mu", 200.0))
+        self.hawkes_alpha = float(cfg.get("hawkes_alpha", 0.5))
+        self.hawkes_beta = float(cfg.get("hawkes_beta", 5.0))
+        self.hawkes_H = 0.0
+        self.max_events = int(cfg.get("max_events", 3000))
+
+        # debug ==================================================
         self.debug = bool(cfg.get("debug", False))
         self.debug_print_every = int(cfg.get("debug_print_every", 0))
         self.debug_snapshot_every = int(cfg.get("debug_snapshot_every", 0))
@@ -124,8 +117,18 @@ class ABMModel(Model):
         self.meta_intensity_log = []
         self.meta_side_log = []
         self.l2_snapshots = []
+        self.regime_log = []
+        self.spread_log = []
+        self.depth_bid_log = []
+        self.depth_ask_log = []
+        self.imbalance_log = []
+        self.trade_count_log = []
+        self.volume_log = []
+        self.mm_requotes_log = []
+        self.mm_requotes_in_step = 0
 
 
+        # create all agents =====================
         uid = 0
         for _ in range(int(n_mm)):
             self.agents_list.append(MarketMaker(uid, self, base_spread_ticks=base_spread_ticks, size=mm_size, ttl=5, ttl_jitter=5))
@@ -150,8 +153,11 @@ class ABMModel(Model):
 
         spread = float(ba - bb) if (bb is not None and ba is not None) else 0.0
         depth_bid, depth_ask = self.market.book.depth_at_best()
+
+        # imbalance 
         imb = (depth_bid - depth_ask) / max(1.0, depth_bid + depth_ask)
 
+        # computing stress indicator E_t = w_r · {rt < −θ_r} + w_s · {s_t > θ_s} + w_I · {|I_t| > θ_I }
         r_flag = 1.0 if last_r < -self.theta_r * self.market.realized_sigma(window=50) * self.dt**0.5 else 0.0
         s_flag = 1.0 if spread > self.theta_s else 0.0
         I_flag = 1.0 if abs(imb) > self.theta_I else 0.0
@@ -159,10 +165,12 @@ class ABMModel(Model):
         shock_trigger = self.xi_wr * r_flag + self.xi_ws * s_flag + self.xi_wI * I_flag
 
         if self.regime == 0:
+            # calm -> stress
             p = min(1.0, self.p01 * (1.0 + shock_trigger))
             if float(self.rng.uniform()) < p:
                 self.regime = 1
         else:
+            # stress -> calm
             p = self.p10
             if float(self.rng.uniform()) < p:
                 self.regime = 0
@@ -171,27 +179,31 @@ class ABMModel(Model):
     def step(self):
         self.update_regime()
         self.maybe_shock()
-
         self.mm_requotes_in_step = 0
 
+        # determine number of events this step (Hawkes process)
         base_scale = self.n_events_calm if self.regime == 0 else self.n_events_stress
         Lambda = self.hawkes_mu + self.hawkes_alpha * self.hawkes_H
         Lambda_reg = Lambda * (base_scale / max(1.0, self.n_events_calm))
 
+        # poisson distribution to get number of events
         Nn = int(self.rng.poisson(Lambda_reg * self.dt))
         n_events = min(self.max_events, max(1, Nn))
 
-        # debug =======
+        # debug ================================================
         self.n_events_log.append(int(n_events))
         self.Nn_log.append(int(Nn))
         self.lambda_log.append(float(Lambda))
         self.lambda_reg_log.append(float(Lambda_reg))
         self.hawkes_H_log.append(float(self.hawkes_H))
         self.hawkes_cap_hit_log.append(int(Nn >= self.max_events))
+        # ======================================================
 
 
+        # market makers react at the beginning of the step (to fill the LOB)
         for i in range(self.n_mm):
             self.agents_list[i].step()
+
 
         mm_reacts_this_step = 0
         for k in range(n_events):
@@ -216,6 +228,8 @@ class ABMModel(Model):
                 self.mid_micro_log.append((t_micro, mid_q))
                 # ------------------------------------------
 
+
+                # market makers may react to the trade
                 if self._mm_pending <= 0 and float(self.rng.uniform()) < self.mm_react_prob:
                     self._mm_pending = self.mm_latency_events
                 else:
@@ -224,6 +238,7 @@ class ABMModel(Model):
                 self.market.book.trade_happened = False
 
 
+            # process pending MM reactions
             if self._mm_pending > 0:
                 self._mm_pending -= 1
                 if self._mm_pending == 0:
@@ -233,29 +248,27 @@ class ABMModel(Model):
 
         self.mm_react_log.append(int(mm_reacts_this_step))
 
-
+        # debug ===============================================
         if self.market.book.t == 200:
             bb = self.market.book.best_bid()
             ba = self.market.book.best_ask()
             sp = self.market.spread()
             db, da = self.market.book.depth_at_best()
-            # print("t=", self.market.book.t, "bb/ba/sp=", bb, ba, sp, "depth=", db, da, "trades_step=", self.market.book.trades_in_step)
-            print(f't={self.market.book.t}  bb={bb:.2f}  ba={ba:.2f}  sp={sp:.3f}  db={db:.2f}  da={da:.2f}  trades_step={self.market.book.trades_in_step}')
+            print(f't={self.market.book.t}  bb={bb}  ba={ba}  sp={sp}  db={db}  da={da}  trades_step={self.market.book.trades_in_step}')
 
 
         self.market.end_step()
+
+        # debug ==============================================
         self.current_price = float(self.market.mid)
         self.volatility = float(self.market.realized_sigma(window=50))
 
         bb = self.market.book.best_bid()
         ba = self.market.book.best_ask()
         spread = float(ba - bb) if (bb is not None and ba is not None) else float("nan")
-
-
         depth_bid, depth_ask = self.market.book.depth_at_best()
         imb = (depth_bid - depth_ask) / max(1.0, depth_bid + depth_ask)
-
-        # debug ==================
+        
         self.regime_log.append(int(self.regime))
         self.spread_log.append(spread)
         self.depth_bid_log.append(float(depth_bid))
@@ -286,12 +299,6 @@ class ABMModel(Model):
         if self.debug_snapshot_every > 0 and (self.market.book.t % self.debug_snapshot_every == 0):
             bids, asks = self.market.book.snapshot_l2(depth=self.debug_l2_depth)
             self.l2_snapshots.append((int(self.market.book.t), float(self.current_price), bids, asks))
-        # ========================
-
-
-        self.market.book.reset_step_counters()
-
-        self.hawkes_H = np.exp(-self.hawkes_beta * self.dt) * self.hawkes_H + float(n_events)
 
         if self.debug_print_every > 0 and (self.market.book.t % self.debug_print_every == 0):
             print(
@@ -306,17 +313,26 @@ class ABMModel(Model):
                 "mm_requote", self.mm_requotes_log[-1],
                 "crossed", self.crossed_log[-1]
             )
+        # ============================================================
+
+        self.market.book.reset_step_counters()
+
+        # update Hawkes process intensity memory
+        self.hawkes_H = np.exp(-self.hawkes_beta * self.dt) * self.hawkes_H + float(n_events)
 
 
     def maybe_shock(self):
-        if self.meta_left <= 0:
+        if self.meta_left <= 0: # if there is no shock now
             if float(self.rng.uniform()) >= self.shock_rate:
                 return
+            
+            # start new shock (choose random number of steps and intensity)
             self.meta_left = int(self.rng.integers(20, 120)) * (2 if self.regime == 1 else 1)
             self.meta_side = "sell" if float(self.rng.uniform()) < 0.6 else "buy"
             self.meta_intensity = int(self.rng.integers(3, 15)) * (3 if self.regime == 1 else 1)
             self.regime = 1
 
+        # execute shock orders (Pareto size distribution = heavy tails)
         for _ in range(self.meta_intensity):
             q = int(pareto_int(self.rng, 5.0, 1.2, 20000))
             self.market.place_market(agent_id=-777, side=self.meta_side, qty=q)
