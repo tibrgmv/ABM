@@ -217,3 +217,76 @@ def run_h1_pricing_experiment(
         "n_mc": int(n_mc)
     }
     return df, by_rep, summary
+
+# ================================================= H3 ==========================================================
+# =============================================== Experiment ====================================================
+def sample_positive_stable(alpha, size, rng): 
+    alpha = float(alpha) 
+    U = rng.uniform(0.0, np.pi, size=size) 
+    W = rng.exponential(1.0, size=size) 
+    part1 = np.sin(alpha * U) / (np.sin(U) ** alpha) 
+    part2 = (np.sin((1.0 - alpha) * U) / W) ** (1.0 - alpha) 
+return part1 * part2
+
+def simulate_frac_and_bs_payoffs(S0, K, r, sigma, T, alpha, n_mc, seed):
+    rng = np.random.default_rng(seed)
+    S = sample_positive_stable(alpha, n_mc, rng)
+    E = (T / np.maximum(S, 1e-16)) ** alpha
+    Z = rng.normal(0.0, 1.0, size=n_mc)
+    ST_frac = S0 * np.exp((r - 0.5 * sigma * sigma) * E + sigma * np.sqrt(E) * Z)
+    ST_bs = S0 * np.exp((r - 0.5 * sigma * sigma) * T + sigma * np.sqrt(T) * Z)
+    disc = np.exp(-r * T)
+    Y = disc * np.maximum(ST_frac - K, 0.0)
+    X = disc * np.maximum(ST_bs - K, 0.0)
+    return Y, X
+
+
+def simulate_frac_and_bs_payoffs_call(S0, K, r, sigma, T, alpha, n_mc, seed):
+    rng = np.random.default_rng(seed)
+    S = sample_positive_stable(alpha, n_mc, rng)
+    E = (T / np.maximum(S, 1e-16)) ** alpha
+    Z = rng.normal(0.0, 1.0, size=n_mc)
+    ST_frac = S0 * np.exp((r - 0.5 * sigma * sigma) * E + sigma * np.sqrt(E) * Z)
+    ST_bs = S0 * np.exp((r - 0.5 * sigma * sigma) * T + sigma * np.sqrt(T) * Z)
+    disc = np.exp(-r * T)
+    Y = disc * np.maximum(ST_frac - K, 0.0)
+    X = disc * np.maximum(ST_bs - K, 0.0)
+    return Y, X
+
+def simulate_frac_and_bs_payoffs_put(S0, K, r, sigma, T, alpha, n_mc, seed):
+    rng = np.random.default_rng(seed)
+    S = sample_positive_stable(alpha, n_mc, rng)
+    E = (T / np.maximum(S, 1e-16)) ** alpha
+    Z = rng.normal(0.0, 1.0, size=n_mc)
+    ST_frac = S0 * np.exp((r - 0.5 * sigma * sigma) * E + sigma * np.sqrt(E) * Z)
+    ST_bs = S0 * np.exp((r - 0.5 * sigma * sigma) * T + sigma * np.sqrt(T) * Z)
+    disc = np.exp(-r * T)
+    Y = disc * np.maximum(K - ST_frac, 0.0)
+    X = disc * np.maximum(K - ST_bs, 0.0)
+    return Y, X
+
+def fractional_price_call_mc_cv(S0, K, r, sigma, T, alpha, n_mc, seed):
+    Y, X = simulate_frac_and_bs_payoffs_call(S0, K, r, sigma, T, alpha, n_mc, seed)
+    EX = bs_price_call(S0, K, r, sigma, T)
+    Xc = X - np.mean(X)
+    Yc = Y - np.mean(Y)
+    varX = float(np.mean(Xc * Xc))
+    if varX <= 0:
+        return float(np.mean(Y))
+    covYX = float(np.mean(Yc * Xc))
+    b = covYX / varX
+    Y_adj = Y - b * (X - EX)
+    return float(np.mean(Y_adj))
+
+def fractional_price_put_mc_cv(S0, K, r, sigma, T, alpha, n_mc, seed):
+    Y, X = simulate_frac_and_bs_payoffs_put(S0, K, r, sigma, T, alpha, n_mc, seed)
+    EX = bs_price_put(S0, K, r, sigma, T)
+    Xc = X - np.mean(X)
+    Yc = Y - np.mean(Y)
+    varX = float(np.mean(Xc * Xc))
+    if varX <= 0:
+        return float(np.mean(Y))
+    covYX = float(np.mean(Yc * Xc))
+    b = covYX / varX
+    Y_adj = Y - b * (X - EX)
+    return float(np.mean(Y_adj))
