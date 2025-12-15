@@ -226,7 +226,7 @@ def sample_positive_stable(alpha, size, rng):
     W = rng.exponential(1.0, size=size) 
     part1 = np.sin(alpha * U) / (np.sin(U) ** alpha) 
     part2 = (np.sin((1.0 - alpha) * U) / W) ** (1.0 - alpha) 
-return part1 * part2
+    return part1 * part2
 
 def simulate_frac_and_bs_payoffs(S0, K, r, sigma, T, alpha, n_mc, seed):
     rng = np.random.default_rng(seed)
